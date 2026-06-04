@@ -1,0 +1,15 @@
+# Environments
+venv/
+.env
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs
+.vscode/
+.idea/
+
+# Fastapi / Uvicorn
+*.log
