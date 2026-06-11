@@ -4,96 +4,135 @@ import base64
 import time
 
 class OpenCVImageProcessor:
-    def apply_filters(self, image_data: bytes, method: str, tolerance: float, max_iterations: int, omega: float) -> dict:
+    def apply_filters(self, image_data: bytes, method: str, tolerance: float, max_iterations: int) -> dict:
         start_time = time.time()
         np_arr = np.frombuffer(image_data, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         
-        if img is None:
-            return {"error": "Invalid image format"}
-            
-        # Convert to float32 for calculations
-        u = img.astype(np.float32)
-        f = np.copy(u) # The original noisy image is our source term
+        # ============================================================
+        # PIPELINE: Convertir a LAB y procesar SOLO el canal L
+        # Esto preserva los colores originales (canales a,b intactos)
+        # y aplica la inversión de difusión únicamente a la luminosidad.
+        # ============================================================
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l_ch, a_ch, b_ch = cv2.split(lab)
         
-        # Hyperparameter for diffusion (Poisson)
-        alpha = 0.25 
+        # Canal L como float32 para el solver iterativo
+        f = l_ch.astype(np.float32)
+        H, W = f.shape[:2]
         
-        # Red-Black masks for vectorization of GS/SOR
-        h, w = u.shape[:2]
-        y, x = np.mgrid[0:h-2, 0:w-2]
+        # ============================================================
+        # MODELO MATEMÁTICO: Deconvolución Iterativa (Inversión de Difusión)
+        #
+        # Problema: La imagen f está degradada (borrosa, con ruido suavizado).
+        # Modelo:   f = (I + α∇²) u_sharp
+        #           La imagen original nítida u sufrió una difusión de calor.
+        #
+        # Solución: Resolver el sistema lineal (I + α∇²) u = f
+        #
+        # Discretización (5-point stencil):
+        #   (1 - 4α) u_{i,j} + α (u_N + u_S + u_W + u_E) = f_{i,j}
+        #
+        # Jacobi:
+        #   u_{i,j}^{new} = [ f_{i,j} - α(u_N + u_S + u_W + u_E) ] / (1 - 4α)
+        #
+        # EFECTO: Invierte la difusión. Los bordes se AMPLIFICAN porque
+        #         el denominador (1-4α) < 1 escala los valores hacia arriba
+        #         en zonas de alto gradiente.
+        #
+        # Estabilidad: α < 0.125 garantiza diagonal dominante → convergencia.
+        # ============================================================
+        
+        alpha = 0.11  # Parámetro de inversión de difusión (α < 0.125 para estabilidad)
+        diag = 1.0 - 4.0 * alpha  # Elemento diagonal de la matriz del sistema
+        
+        # Inicialización: la imagen degradada como primera aproximación
+        u = np.copy(f)
+        u_old = np.empty_like(u)
+        
+        # Red-Black masks para vectorización de Gauss-Seidel/SOR
+        y, x = np.mgrid[0:H-2, 0:W-2]
         mask_red = (x + y) % 2 == 0
         mask_black = (x + y) % 2 == 1
+        
+        # Cálculo del Omega Óptimo
+        # Radio Espectral de Jacobi para el sistema (I + α∇²):
+        cos_max = 0.5 * (np.cos(np.pi / H) + np.cos(np.pi / W))
+        rho_jacobi = (4.0 * alpha / abs(diag)) * cos_max
+        if rho_jacobi < 1.0:
+            omega_opt = 2.0 / (1.0 + np.sqrt(1.0 - rho_jacobi**2))
+        else:
+            omega_opt = 1.0
         
         chart_data = []
         final_error = 0.0
         iters_done = 0
         
-        # Precompute constants
-        coeff_center = 1.0 / (1.0 + 4.0 * alpha)
-        
-        # Pad arrays to handle boundaries easily (Dirichlet boundary condition = keep borders fixed)
-        # We only update the interior: [1:-1, 1:-1]
         for k in range(max_iterations):
-            u_old = np.copy(u)
+            u_old[:] = u
             
             if method == 'jacobi':
-                # Vectorized Jacobi
-                u_neighbors = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
-                u[1:-1, 1:-1] = coeff_center * (f[1:-1, 1:-1] + alpha * u_neighbors)
+                neighbors = u_old[:-2, 1:-1] + u_old[2:, 1:-1] + u_old[1:-1, :-2] + u_old[1:-1, 2:]
+                u[1:-1, 1:-1] = (f[1:-1, 1:-1] - alpha * neighbors) / diag
                 
             elif method == 'gauss-seidel' or method == 'sor':
-                w_param = 1.0 if method == 'gauss-seidel' else omega
+                w = 1.0 if method == 'gauss-seidel' else omega_opt
                 
-                # Update Red
-                u_neighbors_red = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
-                u[1:-1, 1:-1][mask_red] = (1 - w_param) * u[1:-1, 1:-1][mask_red] + \
-                    (w_param * coeff_center) * (f[1:-1, 1:-1][mask_red] + alpha * u_neighbors_red[mask_red])
+                # Red update
+                neighbors_r = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
+                u_gs_r = (f[1:-1, 1:-1] - alpha * neighbors_r) / diag
+                u[1:-1, 1:-1][mask_red] = (1 - w) * u[1:-1, 1:-1][mask_red] + w * u_gs_r[mask_red]
                 
-                # Update Black
-                u_neighbors_black = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
-                u[1:-1, 1:-1][mask_black] = (1 - w_param) * u[1:-1, 1:-1][mask_black] + \
-                    (w_param * coeff_center) * (f[1:-1, 1:-1][mask_black] + alpha * u_neighbors_black[mask_black])
-                    
+                # Black update
+                neighbors_b = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
+                u_gs_b = (f[1:-1, 1:-1] - alpha * neighbors_b) / diag
+                u[1:-1, 1:-1][mask_black] = (1 - w) * u[1:-1, 1:-1][mask_black] + w * u_gs_b[mask_black]
+                
             elif method == 'ssor':
-                w_param = omega
+                w = omega_opt
                 
-                # Forward Sweep (Red then Black)
-                u_neighbors_red = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
-                u[1:-1, 1:-1][mask_red] = (1 - w_param) * u[1:-1, 1:-1][mask_red] + \
-                    (w_param * coeff_center) * (f[1:-1, 1:-1][mask_red] + alpha * u_neighbors_red[mask_red])
+                # Forward Sweep: Red → Black
+                neighbors = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
+                u_gs = (f[1:-1, 1:-1] - alpha * neighbors) / diag
+                u[1:-1, 1:-1][mask_red] = (1 - w) * u[1:-1, 1:-1][mask_red] + w * u_gs[mask_red]
                 
-                u_neighbors_black = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
-                u[1:-1, 1:-1][mask_black] = (1 - w_param) * u[1:-1, 1:-1][mask_black] + \
-                    (w_param * coeff_center) * (f[1:-1, 1:-1][mask_black] + alpha * u_neighbors_black[mask_black])
-                    
-                # Backward Sweep (Black then Red)
-                u_neighbors_black = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
-                u[1:-1, 1:-1][mask_black] = (1 - w_param) * u[1:-1, 1:-1][mask_black] + \
-                    (w_param * coeff_center) * (f[1:-1, 1:-1][mask_black] + alpha * u_neighbors_black[mask_black])
-                    
-                u_neighbors_red = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
-                u[1:-1, 1:-1][mask_red] = (1 - w_param) * u[1:-1, 1:-1][mask_red] + \
-                    (w_param * coeff_center) * (f[1:-1, 1:-1][mask_red] + alpha * u_neighbors_red[mask_red])
+                neighbors = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
+                u_gs = (f[1:-1, 1:-1] - alpha * neighbors) / diag
+                u[1:-1, 1:-1][mask_black] = (1 - w) * u[1:-1, 1:-1][mask_black] + w * u_gs[mask_black]
+                
+                # Backward Sweep: Black → Red
+                neighbors = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
+                u_gs = (f[1:-1, 1:-1] - alpha * neighbors) / diag
+                u[1:-1, 1:-1][mask_black] = (1 - w) * u[1:-1, 1:-1][mask_black] + w * u_gs[mask_black]
+                
+                neighbors = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
+                u_gs = (f[1:-1, 1:-1] - alpha * neighbors) / diag
+                u[1:-1, 1:-1][mask_red] = (1 - w) * u[1:-1, 1:-1][mask_red] + w * u_gs[mask_red]
             
-            # Calculate Error (Infinity Norm)
+            # Cálculo del error de convergencia
             diff = np.abs(u - u_old)
             current_error = float(np.max(diff))
             
-            # Save data points for charting (downsample to avoid huge payloads)
-            if k % max(1, max_iterations // 20) == 0 or k == max_iterations - 1 or current_error < tolerance:
-                chart_data.append({"iteration": k, "error": current_error})
-                
+            chart_data.append({"iteration": k, "error": current_error})
+            
             iters_done = k + 1
             final_error = current_error
             
             if current_error < tolerance:
                 break
-                
-        # Convert back to uint8
-        u = np.clip(u, 0, 255).astype(np.uint8)
         
-        _, buffer = cv2.imencode('.png', u)
+        # Clip al rango válido de L (0-255 en OpenCV LAB)
+        l_sharp = np.clip(u, 0, 255).astype(np.uint8)
+        
+        # CLAHE suave sobre el canal L ya afilado (1.4 para darle un poco más de 'punch')
+        clahe = cv2.createCLAHE(clipLimit=1.4, tileGridSize=(8, 8))
+        l_final = clahe.apply(l_sharp)
+        
+        # Reconstruir imagen: L procesado + a,b ORIGINALES intactos
+        lab_final = cv2.merge((l_final, a_ch, b_ch))
+        result = cv2.cvtColor(lab_final, cv2.COLOR_LAB2BGR)
+        
+        _, buffer = cv2.imencode('.png', result)
         img_base64 = base64.b64encode(buffer).decode('utf-8')
         
         end_time = time.time()
