@@ -10,12 +10,12 @@ class OpenCVImageProcessor:
         img_1x = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         
         # ============================================================
-        # PASO 1: SUPER-RESOLUCIÓN BASE (Bicúbica 2x)
-        # Esto crea una imagen gigante, libre de ruido de píxeles,
-        # pero con bordes matemáticamente borrosos que luego afilaremos.
+        # PASO 1: SUPER-RESOLUCIÓN BASE (2x Lanczos-4)
+        # Usamos Lanczos-4 puro sin filtros de ruido para no destruir
+        # la textura natural de los adoquines.
         # ============================================================
         H_orig, W_orig = img_1x.shape[:2]
-        img = cv2.resize(img_1x, (2*W_orig, 2*H_orig), interpolation=cv2.INTER_CUBIC)
+        img = cv2.resize(img_1x, (2*W_orig, 2*H_orig), interpolation=cv2.INTER_LANCZOS4)
         
         # ============================================================
         # PIPELINE: Convertir a LAB y procesar SOLO el canal L
@@ -48,35 +48,34 @@ class OpenCVImageProcessor:
         #         el denominador (1-4α) < 1 escala los valores hacia arriba
         #         en zonas de alto gradiente.
         #
-        # Estabilidad: α < 0.125 garantiza diagonal dominante → convergencia.
         # ============================================================
+        # INVERSIÓN DE DIFUSIÓN EXTREMA REGULARIZADA
+        # ============================================================
+        alpha = 0.125 # Al límite matemático de la inestabilidad
+        diag = 1.0 - 4.0 * alpha
         
-        alpha = 0.11  # Parámetro de inversión de difusión (α < 0.125 para estabilidad)
-        diag = 1.0 - 4.0 * alpha  # Elemento diagonal de la matriz del sistema
-        
-        # Inicialización: la imagen degradada como primera aproximación
         u = np.copy(f)
         u_old = np.empty_like(u)
         
-        # Red-Black masks para vectorización de Gauss-Seidel/SOR
         y, x = np.mgrid[0:H-2, 0:W-2]
         mask_red = (x + y) % 2 == 0
         mask_black = (x + y) % 2 == 1
         
-        # Cálculo del Omega Óptimo
-        # Radio Espectral de Jacobi para el sistema (I + α∇²):
+        # Omega óptimo
         cos_max = 0.5 * (np.cos(np.pi / H) + np.cos(np.pi / W))
         rho_jacobi = (4.0 * alpha / abs(diag)) * cos_max
         if rho_jacobi < 1.0:
             omega_opt = 2.0 / (1.0 + np.sqrt(1.0 - rho_jacobi**2))
         else:
             omega_opt = 1.0
-        
+            
         chart_data = []
         final_error = 0.0
-        iters_done = 0
         
-        for k in range(max_iterations):
+        # Forzamos 150 iteraciones para un afilado BRUTAL
+        max_iters = 150 
+        
+        for k in range(max_iters):
             u_old[:] = u
             
             if method == 'jacobi':
@@ -86,12 +85,12 @@ class OpenCVImageProcessor:
             elif method == 'gauss-seidel' or method == 'sor':
                 w = 1.0 if method == 'gauss-seidel' else omega_opt
                 
-                # Red update
+                # Red
                 neighbors_r = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
                 u_gs_r = (f[1:-1, 1:-1] - alpha * neighbors_r) / diag
                 u[1:-1, 1:-1][mask_red] = (1 - w) * u[1:-1, 1:-1][mask_red] + w * u_gs_r[mask_red]
                 
-                # Black update
+                # Black
                 neighbors_b = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
                 u_gs_b = (f[1:-1, 1:-1] - alpha * neighbors_b) / diag
                 u[1:-1, 1:-1][mask_black] = (1 - w) * u[1:-1, 1:-1][mask_black] + w * u_gs_b[mask_black]
@@ -99,7 +98,6 @@ class OpenCVImageProcessor:
             elif method == 'ssor':
                 w = omega_opt
                 
-                # Forward Sweep: Red → Black
                 neighbors = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
                 u_gs = (f[1:-1, 1:-1] - alpha * neighbors) / diag
                 u[1:-1, 1:-1][mask_red] = (1 - w) * u[1:-1, 1:-1][mask_red] + w * u_gs[mask_red]
@@ -108,7 +106,6 @@ class OpenCVImageProcessor:
                 u_gs = (f[1:-1, 1:-1] - alpha * neighbors) / diag
                 u[1:-1, 1:-1][mask_black] = (1 - w) * u[1:-1, 1:-1][mask_black] + w * u_gs[mask_black]
                 
-                # Backward Sweep: Black → Red
                 neighbors = u[:-2, 1:-1] + u[2:, 1:-1] + u[1:-1, :-2] + u[1:-1, 2:]
                 u_gs = (f[1:-1, 1:-1] - alpha * neighbors) / diag
                 u[1:-1, 1:-1][mask_black] = (1 - w) * u[1:-1, 1:-1][mask_black] + w * u_gs[mask_black]
@@ -117,17 +114,21 @@ class OpenCVImageProcessor:
                 u_gs = (f[1:-1, 1:-1] - alpha * neighbors) / diag
                 u[1:-1, 1:-1][mask_red] = (1 - w) * u[1:-1, 1:-1][mask_red] + w * u_gs[mask_red]
             
-            # Cálculo del error de convergencia
+            # ============================================================
+            # REGULARIZACIÓN DE TIKHONOV / FILTRO DE CHOQUE (Cada 10 iters)
+            # Previene que la ecuación explote en ruido (checkerboard)
+            # mientras permite que los bordes macro sigan afilándose al infinito.
+            # ============================================================
+            if k > 0 and k % 10 == 0:
+                u = cv2.GaussianBlur(u, (3, 3), 0.5)
+            
+            # Error actual
             diff = np.abs(u - u_old)
             current_error = float(np.max(diff))
-            
-            chart_data.append({"iteration": k, "error": current_error})
-            
-            iters_done = k + 1
             final_error = current_error
             
-            if current_error < tolerance:
-                break
+            chart_data.append({"iteration": k, "error": current_error})
+            iters_done = k + 1
         
         # Clip al rango válido de L (0-255 en OpenCV LAB)
         l_final = np.clip(u, 0, 255).astype(np.uint8)
