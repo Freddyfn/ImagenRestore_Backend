@@ -7,7 +7,15 @@ class OpenCVImageProcessor:
     def apply_filters(self, image_data: bytes, method: str, tolerance: float, max_iterations: int) -> dict:
         start_time = time.time()
         np_arr = np.frombuffer(image_data, np.uint8)
-        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        img_1x = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        
+        # ============================================================
+        # PASO 1: SUPER-RESOLUCIÓN BASE (Bicúbica 2x)
+        # Esto crea una imagen gigante, libre de ruido de píxeles,
+        # pero con bordes matemáticamente borrosos que luego afilaremos.
+        # ============================================================
+        H_orig, W_orig = img_1x.shape[:2]
+        img = cv2.resize(img_1x, (2*W_orig, 2*H_orig), interpolation=cv2.INTER_CUBIC)
         
         # ============================================================
         # PIPELINE: Convertir a LAB y procesar SOLO el canal L
@@ -122,11 +130,7 @@ class OpenCVImageProcessor:
                 break
         
         # Clip al rango válido de L (0-255 en OpenCV LAB)
-        l_sharp = np.clip(u, 0, 255).astype(np.uint8)
-        
-        # CLAHE suave sobre el canal L ya afilado (1.4 para darle un poco más de 'punch')
-        clahe = cv2.createCLAHE(clipLimit=1.4, tileGridSize=(8, 8))
-        l_final = clahe.apply(l_sharp)
+        l_final = np.clip(u, 0, 255).astype(np.uint8)
         
         # Reconstruir imagen: L procesado + a,b ORIGINALES intactos
         lab_final = cv2.merge((l_final, a_ch, b_ch))
